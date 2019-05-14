@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from data_cleaning import ParkingDataLoader
+
 parser = argparse.ArgumentParser('ODE demo')
 parser.add_argument('--method', type=str, choices=['dopri5', 'adams'], default='dopri5')
 parser.add_argument('--data_size', type=int, default=1000)
@@ -25,6 +27,9 @@ else:
     from torchdiffeq import odeint
 
 device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+
+loader = ParkingDataLoader()
+train_data, validation_data, test_data = loader.get_train_validation_test_datasets()
 
 true_y0 = torch.tensor([[2., 0.]])
 t = torch.linspace(0., 25., args.data_size)
