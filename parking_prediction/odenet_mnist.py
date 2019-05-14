@@ -5,7 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset, Dataset, DataLoader
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
@@ -26,6 +26,10 @@ parser.add_argument('--save', type=str, default='./experiment1')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
 args = parser.parse_args()
+
+loader = ParkingDataLoader()
+
+train_data, validation_data, test_data = loader.get_train_validation_test_datasets()
 
 if args.adjoint:
     from torchdiffeq import odeint_adjoint as odeint
@@ -97,21 +101,21 @@ class ODEfunc(nn.Module):
         super(ODEfunc, self).__init__()
         self.norm1 = norm(dim)
         self.relu = nn.ReLU(inplace=True)
-        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.lin1 = nn.Linear(dim, dim)
         self.norm2 = norm(dim)
-        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
-        self.norm3 = norm(dim)
+#         self.lin2 = nn.Linear(dim, dim)
+#         self.norm3 = norm(dim)
         self.nfe = 0
 
     def forward(self, t, x):
         self.nfe += 1
         out = self.norm1(x)
         out = self.relu(out)
-        out = self.conv1(t, out)
+        out = self.lin1(out)
         out = self.norm2(out)
-        out = self.relu(out)
-        out = self.conv2(t, out)
-        out = self.norm3(out)
+#         out = self.relu(out)
+#         out = self.lin2(out)
+#         out = self.norm3(out)
         return out
 
 
@@ -165,34 +169,31 @@ class RunningAverageMeter(object):
         self.val = val
 
 
-def get_mnist_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
-    if data_aug:
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(28, padding=4),
-            transforms.ToTensor(),
-        ])
-    else:
-        transform_train = transforms.Compose([
-            transforms.ToTensor(),
-        ])
-
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-    ])
-
+def get_mnist_loaders(batch_size=128, test_batch_size=1000, perc=1.0):
+    # train_data, validation_data, test_data
+    
     train_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_train), batch_size=batch_size,
-        shuffle=True, num_workers=2, drop_last=True
+        TensorDataset(
+            torch.tensor(train_data.drop('Occupied', axis=1).values.astype(np.float32)),
+            torch.tensor(train_data['Occupied'].values.astype(np.float32).reshape((len(train_data), 1)))
+        ),
+        batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True
     )
 
     train_eval_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_test),
-        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+        TensorDataset(
+            torch.tensor(validation_data.drop('Occupied', axis=1).values.astype(np.float32)),
+            torch.tensor(validation_data['Occupied'].values.astype(np.float32).reshape((len(validation_data), 1)))
+        ),
+        batch_size=test_batch_size, shuffle=True, num_workers=2, drop_last=True
     )
 
     test_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=False, download=True, transform=transform_test),
-        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+        TensorDataset(
+            torch.tensor(test_data.drop('Occupied', axis=1).values.astype(np.float32)),
+            torch.tensor(test_data['Occupied'].values.astype(np.float32).reshape((len(test_data), 1)))
+        ),
+        batch_size=test_batch_size, shuffle=True, num_workers=2, drop_last=True
     )
 
     return train_loader, test_loader, train_eval_loader
@@ -229,15 +230,13 @@ def one_hot(x, K):
 
 
 def accuracy(model, dataset_loader):
-    total_correct = 0
+    losses = []
     for x, y in dataset_loader:
         x = x.to(device)
-        y = one_hot(np.array(y.numpy()), 10)
-
-        target_class = np.argmax(y, axis=1)
-        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
-        total_correct += np.sum(predicted_class == target_class)
-    return total_correct / len(dataset_loader.dataset)
+        logits = model(x)     
+        loss = criterion(logits, y)
+        losses.append(loss.numpy())
+    return 1 - sum(losses) / len(losses)
 
 
 def count_parameters(model):
@@ -264,21 +263,11 @@ def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True
         console_handler = logging.StreamHandler()
         console_handler.setLevel(level)
         logger.addHandler(console_handler)
-    logger.info(filepath)
-    with open(filepath, "r") as f:
-        logger.info(f.read())
-
-    for f in package_files:
-        logger.info(f)
-        with open(f, "r") as package_f:
-            logger.info(package_f.read())
-
     return logger
 
 
 if __name__ == '__main__':
 
-    makedirs(args.save)
     logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
     logger.info(args)
 
@@ -286,35 +275,20 @@ if __name__ == '__main__':
 
     is_odenet = args.network == 'odenet'
 
-    if args.downsampling_method == 'conv':
-        downsampling_layers = [
-            nn.Conv2d(1, 64, 3, 1),
-            norm(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 4, 2, 1),
-            norm(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 4, 2, 1),
-        ]
-    elif args.downsampling_method == 'res':
-        downsampling_layers = [
-            nn.Conv2d(1, 64, 3, 1),
-            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
-            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
-        ]
+    # feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+    feature_layers = [ODEBlock(ODEfunc(8)) for _ in range(1)]
+    # fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+    fc_layers = [nn.Linear(8, 1)]
 
-    feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
-    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
-
-    model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+    model = nn.Sequential(nn.Linear(16, 8), *feature_layers, *fc_layers).to(device)
 
     logger.info(model)
     logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
-    criterion = nn.CrossEntropyLoss().to(device)
+    criterion = nn.MSELoss().to(device)
 
     train_loader, test_loader, train_eval_loader = get_mnist_loaders(
-        args.data_aug, args.batch_size, args.test_batch_size
+        args.batch_size, args.test_batch_size
     )
 
     data_gen = inf_generator(train_loader)
@@ -334,36 +308,26 @@ if __name__ == '__main__':
     end = time.time()
 
     for itr in range(args.nepochs * batches_per_epoch):
-
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr_fn(itr)
 
         optimizer.zero_grad()
         x, y = data_gen.__next__()
+
         x = x.to(device)
         y = y.to(device)
         logits = model(x)
         loss = criterion(logits, y)
-
-        if is_odenet:
-            nfe_forward = feature_layers[0].nfe
-            feature_layers[0].nfe = 0
-
         loss.backward()
         optimizer.step()
 
-        if is_odenet:
-            nfe_backward = feature_layers[0].nfe
-            feature_layers[0].nfe = 0
-
         batch_time_meter.update(time.time() - end)
-        if is_odenet:
-            f_nfe_meter.update(nfe_forward)
-            b_nfe_meter.update(nfe_backward)
+
         end = time.time()
 
         if itr % batches_per_epoch == 0:
             with torch.no_grad():
+                print("--------------------------------")
                 train_acc = accuracy(model, train_eval_loader)
                 val_acc = accuracy(model, test_loader)
                 if val_acc > best_acc:
