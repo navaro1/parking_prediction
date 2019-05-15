@@ -1,26 +1,24 @@
-import os
 import argparse
 import logging
+import os
 import time
+
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import TensorDataset, Dataset, DataLoader
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
-
 from data_cleaning import ParkingDataLoader
+from torch.utils.data import TensorDataset, DataLoader
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
 parser.add_argument('--tol', type=float, default=1e-3)
 parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
 parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
-parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--nepochs', type=int, default=100)
 parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
-parser.add_argument('--lr', type=float, default=0.1)
-parser.add_argument('--batch_size', type=int, default=128)
-parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--lr', type=float, default=0.01)
+parser.add_argument('--batch_size', type=int, default=256)
+parser.add_argument('--test_batch_size', type=int, default=256)
 
 parser.add_argument('--save', type=str, default='./experiment1')
 parser.add_argument('--debug', action='store_true')
@@ -29,7 +27,8 @@ args = parser.parse_args()
 
 loader = ParkingDataLoader()
 
-train_data, validation_data, test_data = loader.get_train_validation_test_datasets()
+train_data, validation_data, test_data = loader.get_train_validation_test_datasets(validation_split=0.16,
+                                                                                   test_split=0.2)
 
 if args.adjoint:
     from torchdiffeq import odeint_adjoint as odeint
@@ -37,85 +36,28 @@ else:
     from torchdiffeq import odeint
 
 
-def conv3x3(in_planes, out_planes, stride=1):
-    """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
-
-
-def conv1x1(in_planes, out_planes, stride=1):
-    """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
-
-
 def norm(dim):
     return nn.GroupNorm(min(32, dim), dim)
-
-
-class ResBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, inplanes, planes, stride=1, downsample=None):
-        super(ResBlock, self).__init__()
-        self.norm1 = norm(inplanes)
-        self.relu = nn.ReLU(inplace=True)
-        self.downsample = downsample
-        self.conv1 = conv3x3(inplanes, planes, stride)
-        self.norm2 = norm(planes)
-        self.conv2 = conv3x3(planes, planes)
-
-    def forward(self, x):
-        shortcut = x
-
-        out = self.relu(self.norm1(x))
-
-        if self.downsample is not None:
-            shortcut = self.downsample(out)
-
-        out = self.conv1(out)
-        out = self.norm2(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-
-        return out + shortcut
-
-
-class ConcatConv2d(nn.Module):
-
-    def __init__(self, dim_in, dim_out, ksize=3, stride=1, padding=0, dilation=1, groups=1, bias=True, transpose=False):
-        super(ConcatConv2d, self).__init__()
-        module = nn.ConvTranspose2d if transpose else nn.Conv2d
-        self._layer = module(
-            dim_in + 1, dim_out, kernel_size=ksize, stride=stride, padding=padding, dilation=dilation, groups=groups,
-            bias=bias
-        )
-
-    def forward(self, t, x):
-        tt = torch.ones_like(x[:, :1, :, :]) * t
-        ttx = torch.cat([tt, x], 1)
-        return self._layer(ttx)
 
 
 class ODEfunc(nn.Module):
 
     def __init__(self, dim):
         super(ODEfunc, self).__init__()
-        self.norm1 = norm(dim)
         self.relu = nn.ReLU(inplace=True)
         self.lin1 = nn.Linear(dim, dim)
-        self.norm2 = norm(dim)
-#         self.lin2 = nn.Linear(dim, dim)
-#         self.norm3 = norm(dim)
+        self.lin2 = nn.Linear(dim, dim)
+        self.lin3 = nn.Linear(dim, dim)
         self.nfe = 0
 
     def forward(self, t, x):
         self.nfe += 1
-        out = self.norm1(x)
-        out = self.relu(out)
+        out = self.relu(x)
         out = self.lin1(out)
-        out = self.norm2(out)
-#         out = self.relu(out)
-#         out = self.lin2(out)
-#         out = self.norm3(out)
+        out = self.relu(out)
+        out = self.lin2(out)
+        out = self.relu(out)
+        out = self.lin3(out)
         return out
 
 
@@ -169,9 +111,9 @@ class RunningAverageMeter(object):
         self.val = val
 
 
-def get_mnist_loaders(batch_size=128, test_batch_size=1000, perc=1.0):
+def get_mnist_loaders(batch_size=128, test_batch_size=256):
     # train_data, validation_data, test_data
-    
+
     train_loader = DataLoader(
         TensorDataset(
             torch.tensor(train_data.drop('Occupied', axis=1).values.astype(np.float32)),
@@ -233,10 +175,11 @@ def accuracy(model, dataset_loader):
     losses = []
     for x, y in dataset_loader:
         x = x.to(device)
-        logits = model(x)     
+        y = y.to(device)
+        logits = model(x)
         loss = criterion(logits, y)
-        losses.append(loss.numpy())
-    return 1 - sum(losses) / len(losses)
+        losses.append(np.sqrt(loss.cpu().detach().numpy()))
+    return (1 - sum(losses) / len(losses)) * 100
 
 
 def count_parameters(model):
@@ -248,7 +191,7 @@ def makedirs(dirname):
         os.makedirs(dirname)
 
 
-def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=False, debug=False):
     logger = logging.getLogger()
     if debug:
         level = logging.DEBUG
@@ -266,24 +209,20 @@ def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True
     return logger
 
 
+def getModel(size=64, layers=1):
+    global model
+    feature_layers = [ODEBlock(ODEfunc(size)) for _ in range(layers)]
+    fc_layers = [nn.Linear(size, 1)]
+    model = nn.Sequential(nn.Linear(16, size), *feature_layers, *fc_layers).to(device)
+    return model
+
+
 if __name__ == '__main__':
 
     logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
     logger.info(args)
 
     device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
-
-    is_odenet = args.network == 'odenet'
-
-    # feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
-    feature_layers = [ODEBlock(ODEfunc(8)) for _ in range(1)]
-    # fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
-    fc_layers = [nn.Linear(8, 1)]
-
-    model = nn.Sequential(nn.Linear(16, 8), *feature_layers, *fc_layers).to(device)
-
-    logger.info(model)
-    logger.info('Number of parameters: {}'.format(count_parameters(model)))
 
     criterion = nn.MSELoss().to(device)
 
@@ -299,44 +238,66 @@ if __name__ == '__main__':
         decay_rates=[1, 0.1, 0.01, 0.001]
     )
 
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
     f_nfe_meter = RunningAverageMeter()
     b_nfe_meter = RunningAverageMeter()
     end = time.time()
 
-    for itr in range(args.nepochs * batches_per_epoch):
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_fn(itr)
+    for dims in [768, 512, 256, 128, 64, 32]:
+        for layers in [12, 10, 8, 6, 4, 2]:
+            try:
+                model = getModel(dims, layers=layers)
+                optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+                logger.info(model)
+                logger.info('Number of parameters: {}'.format(count_parameters(model)))
+                print(args.nepochs * batches_per_epoch)
+                with open("results2", mode="a") as f:
+                    f.write("layers: " + str(layers) + "\n")
+                    f.write("dims: " + str(dims) + "\n")
+                for itr in range(args.nepochs * batches_per_epoch):
+                    for param_group in optimizer.param_groups:
+                        param_group['lr'] = lr_fn(itr)
 
-        optimizer.zero_grad()
-        x, y = data_gen.__next__()
+                    optimizer.zero_grad()
+                    x, y = data_gen.__next__()
 
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
+                    x = x.to(device)
+                    y = y.to(device)
+                    logits = model(x)
+                    loss = criterion(logits, y)
+                    loss.backward()
+                    optimizer.step()
 
-        batch_time_meter.update(time.time() - end)
+                    batch_time_meter.update(time.time() - end)
 
-        end = time.time()
+                    end = time.time()
 
-        if itr % batches_per_epoch == 0:
-            with torch.no_grad():
-                print("--------------------------------")
-                train_acc = accuracy(model, train_eval_loader)
-                val_acc = accuracy(model, test_loader)
-                if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
-                    best_acc = val_acc
-                logger.info(
-                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
-                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                        b_nfe_meter.avg, train_acc, val_acc
-                    )
-                )
+                    if itr % batches_per_epoch == 0:
+                        with torch.no_grad():
+                            train_acc = accuracy(model, train_eval_loader)
+                            val_acc = accuracy(model, test_loader)
+                            if val_acc > best_acc:
+                                torch.save({'state_dict': model.state_dict(), 'args': args},
+                                           os.path.join(args.save, 'model.pth'))
+                                best_acc = val_acc
+                            print("------------------------")
+                            print("loss:", 100 - np.sqrt(loss.cpu().detach().numpy()) * 100)
+                            logger.info(
+                                "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                                "Train Acc {:.10f} | Test Acc {:.10f}".format(
+                                    itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg,
+                                    f_nfe_meter.avg,
+                                    b_nfe_meter.avg, train_acc, val_acc
+                                )
+                            )
+                with open("results2", mode="a") as f:
+                    f.write("layers: " + str(layers) + "\n")
+                    f.write("dims: " + str(dims) + "\n")
+                    f.write("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                            "Train Acc {:.10f} | Test Acc {:.10f} \n".format(0, batch_time_meter.val, batch_time_meter.avg,
+                                                                          f_nfe_meter.avg, b_nfe_meter.avg, train_acc,
+                                                                          val_acc))
+            except Exception as error:
+                print(error)
+                pass
