@@ -253,6 +253,7 @@ if __name__ == '__main__':
                 logger.info('Number of parameters: {}'.format(count_parameters(model)))
                 print(args.nepochs * batches_per_epoch)
                 with open("results2", mode="a") as f:
+                    f.write("-------------------------------------------------")
                     f.write("layers: " + str(layers) + "\n")
                     f.write("dims: " + str(dims) + "\n")
                 for itr in range(args.nepochs * batches_per_epoch):
@@ -291,13 +292,14 @@ if __name__ == '__main__':
                                     b_nfe_meter.avg, train_acc, val_acc
                                 )
                             )
-                with open("results2", mode="a") as f:
-                    f.write("layers: " + str(layers) + "\n")
-                    f.write("dims: " + str(dims) + "\n")
-                    f.write("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                            "Train Acc {:.10f} | Test Acc {:.10f} \n".format(0, batch_time_meter.val, batch_time_meter.avg,
-                                                                          f_nfe_meter.avg, b_nfe_meter.avg, train_acc,
-                                                                          val_acc))
+                            with open("results2", mode="a") as f:
+                                f.write("Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                                        "Train Acc {:.10f} | Test Acc {:.10f} \n".format(itr, batch_time_meter.val,
+                                                                                         batch_time_meter.avg,
+                                                                                         f_nfe_meter.avg,
+                                                                                         b_nfe_meter.avg, train_acc,
+                                                                                         val_acc))
+
             except Exception as error:
                 print(error)
                 pass
